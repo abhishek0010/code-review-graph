@@ -7,8 +7,11 @@ from code_review_graph.graph import GraphStore, _sanitize_name, node_to_dict
 from code_review_graph.parser import EdgeInfo, NodeInfo
 from code_review_graph.tools import (
     get_affected_flows_func,
+    get_architecture_overview_func,
+    get_community_func,
     get_docs_section,
     get_flow,
+    list_communities_func,
     list_flows,
 )
 
@@ -481,3 +484,205 @@ class TestFlowTools:
         )
         assert "flow(s) affected" in result["summary"]
         assert "changed_files" in result
+
+
+class TestCommunityTools:
+    """Tests for community-related MCP tool functions."""
+
+    def setup_method(self):
+        """Set up a temp dir with .git and .code-review-graph, seed clustered graph."""
+        self.tmp_dir = tempfile.mkdtemp()
+        self.root = Path(self.tmp_dir).resolve()
+
+        # Create markers so _validate_repo_root accepts this directory
+        (self.root / ".git").mkdir()
+        (self.root / ".code-review-graph").mkdir()
+
+        db_path = str(self.root / ".code-review-graph" / "graph.db")
+        self.store = GraphStore(db_path)
+        self._seed_data()
+        self._build_communities()
+
+    def teardown_method(self):
+        self.store.close()
+        import shutil
+        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+
+    def _seed_data(self):
+        """Seed the store with two clusters of related nodes."""
+        # Cluster 1: auth module
+        auth_py = str(self.root / "auth.py")
+        self.store.upsert_node(NodeInfo(
+            kind="File", name="auth.py",
+            file_path=auth_py,
+            line_start=1, line_end=60, language="python",
+        ))
+        self.store.upsert_node(NodeInfo(
+            kind="Class", name="AuthService",
+            file_path=auth_py,
+            line_start=5, line_end=50, language="python",
+        ))
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name="login",
+            file_path=auth_py,
+            line_start=10, line_end=25, language="python",
+            parent_name="AuthService",
+        ))
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name="logout",
+            file_path=auth_py,
+            line_start=30, line_end=45, language="python",
+            parent_name="AuthService",
+        ))
+
+        # Cluster 2: db module
+        db_py = str(self.root / "db.py")
+        self.store.upsert_node(NodeInfo(
+            kind="File", name="db.py",
+            file_path=db_py,
+            line_start=1, line_end=50, language="python",
+        ))
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name="query",
+            file_path=db_py,
+            line_start=5, line_end=20, language="python",
+        ))
+        self.store.upsert_node(NodeInfo(
+            kind="Function", name="connect",
+            file_path=db_py,
+            line_start=25, line_end=40, language="python",
+        ))
+
+        # Intra-cluster edges
+        self.store.upsert_edge(EdgeInfo(
+            kind="CONTAINS", source=auth_py,
+            target=f"{auth_py}::AuthService", file_path=auth_py,
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="CONTAINS", source=f"{auth_py}::AuthService",
+            target=f"{auth_py}::AuthService.login", file_path=auth_py,
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="CONTAINS", source=f"{auth_py}::AuthService",
+            target=f"{auth_py}::AuthService.logout", file_path=auth_py,
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="CALLS", source=f"{auth_py}::AuthService.login",
+            target=f"{auth_py}::AuthService.logout", file_path=auth_py, line=15,
+        ))
+
+        self.store.upsert_edge(EdgeInfo(
+            kind="CONTAINS", source=db_py,
+            target=f"{db_py}::query", file_path=db_py,
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="CONTAINS", source=db_py,
+            target=f"{db_py}::connect", file_path=db_py,
+        ))
+        self.store.upsert_edge(EdgeInfo(
+            kind="CALLS", source=f"{db_py}::query",
+            target=f"{db_py}::connect", file_path=db_py, line=10,
+        ))
+
+        # Cross-cluster edge: login -> query
+        self.store.upsert_edge(EdgeInfo(
+            kind="CALLS", source=f"{auth_py}::AuthService.login",
+            target=f"{db_py}::query", file_path=auth_py, line=20,
+        ))
+        self.store.commit()
+
+    def _build_communities(self):
+        """Detect and store communities."""
+        from code_review_graph.communities import detect_communities, store_communities
+        comms = detect_communities(self.store)
+        store_communities(self.store, comms)
+
+    def test_list_communities_returns_ok(self):
+        result = list_communities_func(repo_root=str(self.root))
+        assert result["status"] == "ok"
+        assert "communities" in result
+        assert len(result["communities"]) >= 1
+
+    def test_list_communities_summary(self):
+        result = list_communities_func(repo_root=str(self.root))
+        assert "Found" in result["summary"]
+        assert "communities" in result["summary"]
+
+    def test_list_communities_sort_by_cohesion(self):
+        result = list_communities_func(repo_root=str(self.root), sort_by="cohesion")
+        assert result["status"] == "ok"
+
+    def test_list_communities_min_size(self):
+        result = list_communities_func(repo_root=str(self.root), min_size=100)
+        assert result["status"] == "ok"
+        # No community should be that large in our test data
+        assert len(result["communities"]) == 0
+
+    def test_get_community_by_id(self):
+        # First list to get a community ID
+        comms_result = list_communities_func(repo_root=str(self.root))
+        assert len(comms_result["communities"]) >= 1
+        cid = comms_result["communities"][0]["id"]
+
+        result = get_community_func(community_id=cid, repo_root=str(self.root))
+        assert result["status"] == "ok"
+        assert "community" in result
+        assert result["community"]["id"] == cid
+
+    def test_get_community_by_name(self):
+        # Get a community name from list
+        comms_result = list_communities_func(repo_root=str(self.root))
+        assert len(comms_result["communities"]) >= 1
+        name = comms_result["communities"][0]["name"]
+
+        result = get_community_func(community_name=name, repo_root=str(self.root))
+        assert result["status"] == "ok"
+        assert "community" in result
+
+    def test_get_community_not_found(self):
+        result = get_community_func(
+            community_id=99999, repo_root=str(self.root)
+        )
+        assert result["status"] == "not_found"
+
+    def test_get_community_name_not_found(self):
+        result = get_community_func(
+            community_name="nonexistent_xyz_zzz", repo_root=str(self.root)
+        )
+        assert result["status"] == "not_found"
+
+    def test_get_community_include_members(self):
+        comms_result = list_communities_func(repo_root=str(self.root))
+        assert len(comms_result["communities"]) >= 1
+        cid = comms_result["communities"][0]["id"]
+
+        result = get_community_func(
+            community_id=cid, include_members=True, repo_root=str(self.root)
+        )
+        assert result["status"] == "ok"
+        assert "member_details" in result["community"]
+        assert len(result["community"]["member_details"]) >= 1
+
+    def test_get_community_summary_format(self):
+        comms_result = list_communities_func(repo_root=str(self.root))
+        cid = comms_result["communities"][0]["id"]
+        result = get_community_func(community_id=cid, repo_root=str(self.root))
+        assert "nodes" in result["summary"]
+        assert "cohesion" in result["summary"]
+
+    def test_get_architecture_overview_returns_ok(self):
+        result = get_architecture_overview_func(repo_root=str(self.root))
+        assert result["status"] == "ok"
+
+    def test_get_architecture_overview_has_expected_keys(self):
+        result = get_architecture_overview_func(repo_root=str(self.root))
+        assert "communities" in result
+        assert "cross_community_edges" in result
+        assert "warnings" in result
+        assert "summary" in result
+
+    def test_get_architecture_overview_summary_format(self):
+        result = get_architecture_overview_func(repo_root=str(self.root))
+        assert "Architecture:" in result["summary"]
+        assert "communities" in result["summary"]
+        assert "cross-community edges" in result["summary"]

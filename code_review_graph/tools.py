@@ -1,6 +1,6 @@
 """MCP tool definitions for the Code Review Graph server.
 
-Exposes 12 tools:
+Exposes 15 tools:
 1. build_or_update_graph  - full or incremental build
 2. get_impact_radius      - blast radius from changed files
 3. query_graph            - predefined graph queries
@@ -13,6 +13,9 @@ Exposes 12 tools:
 10. list_flows            - list execution flows sorted by criticality
 11. get_flow              - get details of a single execution flow
 12. get_affected_flows    - find flows affected by changed files
+13. list_communities      - list detected code communities
+14. get_community         - get details of a single community
+15. get_architecture_overview - architecture overview from community structure
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from .communities import get_architecture_overview, get_communities
 from .embeddings import EmbeddingStore, embed_all_nodes, semantic_search
 from .flows import get_affected_flows as _get_affected_flows
 from .flows import get_flow_by_id, get_flows
@@ -1110,6 +1114,155 @@ def get_affected_flows_func(
             "changed_files": changed_files,
             "affected_flows": result["affected_flows"],
             "total": total,
+        }
+    except Exception as exc:
+        return {"status": "error", "error": str(exc)}
+    finally:
+        store.close()
+
+
+# ---------------------------------------------------------------------------
+# Tool 13: list_communities  [EXPLORE]
+# ---------------------------------------------------------------------------
+
+
+def list_communities_func(
+    repo_root: str | None = None,
+    sort_by: str = "size",
+    min_size: int = 0,
+) -> dict[str, Any]:
+    """List detected code communities in the codebase.
+
+    [EXPLORE] Retrieves stored communities from the knowledge graph.
+    Each community represents a cluster of related code entities
+    (functions, classes) detected via the Leiden algorithm or
+    file-based grouping.
+
+    Args:
+        repo_root: Repository root path. Auto-detected if omitted.
+        sort_by: Sort column: size, cohesion, or name.
+        min_size: Minimum community size to include (default: 0).
+
+    Returns:
+        List of communities with size and cohesion scores.
+    """
+    store, root = _get_store(repo_root)
+    try:
+        communities = get_communities(store, sort_by=sort_by, min_size=min_size)
+        return {
+            "status": "ok",
+            "summary": f"Found {len(communities)} communities",
+            "communities": communities,
+        }
+    except Exception as exc:
+        return {"status": "error", "error": str(exc)}
+    finally:
+        store.close()
+
+
+# ---------------------------------------------------------------------------
+# Tool 14: get_community  [EXPLORE]
+# ---------------------------------------------------------------------------
+
+
+def get_community_func(
+    community_name: str | None = None,
+    community_id: int | None = None,
+    include_members: bool = False,
+    repo_root: str | None = None,
+) -> dict[str, Any]:
+    """Get details of a single code community.
+
+    [EXPLORE] Retrieves a community by its database ID or by name match.
+    Optionally includes the full list of member nodes.
+
+    Args:
+        community_name: Name to search for (partial match). Ignored if community_id given.
+        community_id: Database ID of the community.
+        include_members: If True, include full member node details.
+        repo_root: Repository root path. Auto-detected if omitted.
+
+    Returns:
+        Community details, or not_found status.
+    """
+    store, root = _get_store(repo_root)
+    try:
+        community: dict | None = None
+        all_communities = get_communities(store)
+
+        if community_id is not None:
+            for c in all_communities:
+                if c.get("id") == community_id:
+                    community = c
+                    break
+        elif community_name is not None:
+            for c in all_communities:
+                if community_name.lower() in c["name"].lower():
+                    community = c
+                    break
+
+        if community is None:
+            return {
+                "status": "not_found",
+                "summary": "No community found matching the given criteria.",
+            }
+
+        if include_members:
+            cid = community.get("id")
+            if cid is not None:
+                rows = store._conn.execute(
+                    "SELECT * FROM nodes WHERE community_id = ?", (cid,)
+                ).fetchall()
+                members = [node_to_dict(store._row_to_node(row)) for row in rows]
+                community["member_details"] = members
+
+        return {
+            "status": "ok",
+            "summary": (
+                f"Community '{community['name']}': {community['size']} nodes, "
+                f"cohesion {community['cohesion']:.4f}"
+            ),
+            "community": community,
+        }
+    except Exception as exc:
+        return {"status": "error", "error": str(exc)}
+    finally:
+        store.close()
+
+
+# ---------------------------------------------------------------------------
+# Tool 15: get_architecture_overview  [EXPLORE]
+# ---------------------------------------------------------------------------
+
+
+def get_architecture_overview_func(
+    repo_root: str | None = None,
+) -> dict[str, Any]:
+    """Generate an architecture overview based on community structure.
+
+    [EXPLORE] Builds a high-level view of the codebase architecture by
+    analyzing community boundaries and cross-community coupling.
+    Includes warnings for high coupling between communities.
+
+    Args:
+        repo_root: Repository root path. Auto-detected if omitted.
+
+    Returns:
+        Architecture overview with communities, cross-community edges, and warnings.
+    """
+    store, root = _get_store(repo_root)
+    try:
+        overview = get_architecture_overview(store)
+        n_communities = len(overview["communities"])
+        n_cross = len(overview["cross_community_edges"])
+        n_warnings = len(overview["warnings"])
+        return {
+            "status": "ok",
+            "summary": (
+                f"Architecture: {n_communities} communities, "
+                f"{n_cross} cross-community edges, {n_warnings} warning(s)"
+            ),
+            **overview,
         }
     except Exception as exc:
         return {"status": "error", "error": str(exc)}

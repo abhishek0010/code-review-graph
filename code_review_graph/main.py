@@ -15,10 +15,13 @@ from .tools import (
     embed_graph,
     find_large_functions,
     get_affected_flows_func,
+    get_architecture_overview_func,
+    get_community_func,
     get_docs_section,
     get_flow,
     get_impact_radius,
     get_review_context,
+    list_communities_func,
     list_flows,
     list_graph_stats,
     query_graph,
@@ -311,6 +314,71 @@ def get_affected_flows_tool(
     return get_affected_flows_func(
         changed_files=changed_files, base=base, repo_root=repo_root,
     )
+
+
+@mcp.tool()
+def list_communities_tool(
+    sort_by: str = "size",
+    min_size: int = 0,
+    repo_root: Optional[str] = None,
+) -> dict:
+    """List detected code communities in the codebase.
+
+    Each community represents a cluster of related code entities (functions,
+    classes) detected via the Leiden algorithm or file-based grouping.
+    Use this to understand the high-level structure of the codebase.
+
+    Args:
+        sort_by: Sort column: size, cohesion, or name.
+        min_size: Minimum community size to include. Default: 0.
+        repo_root: Repository root path. Auto-detected if omitted.
+    """
+    return list_communities_func(
+        repo_root=repo_root, sort_by=sort_by, min_size=min_size,
+    )
+
+
+@mcp.tool()
+def get_community_tool(
+    community_name: Optional[str] = None,
+    community_id: Optional[int] = None,
+    include_members: bool = False,
+    repo_root: Optional[str] = None,
+) -> dict:
+    """Get detailed information about a single code community.
+
+    Returns community metadata including size, cohesion, dominant language,
+    and member list. Optionally includes full node details for each member.
+
+    Provide either community_id (from list_communities_tool) or community_name
+    to search by name.
+
+    Args:
+        community_name: Name to search for (partial match). Ignored if community_id given.
+        community_id: Database ID of the community.
+        include_members: Include full member node details. Default: False.
+        repo_root: Repository root path. Auto-detected if omitted.
+    """
+    return get_community_func(
+        community_name=community_name, community_id=community_id,
+        include_members=include_members, repo_root=repo_root,
+    )
+
+
+@mcp.tool()
+def get_architecture_overview_tool(
+    repo_root: Optional[str] = None,
+) -> dict:
+    """Generate an architecture overview based on community structure.
+
+    Builds a high-level view of the codebase architecture by analyzing
+    community boundaries and cross-community coupling. Includes warnings
+    for high coupling between communities.
+
+    Args:
+        repo_root: Repository root path. Auto-detected if omitted.
+    """
+    return get_architecture_overview_func(repo_root=repo_root)
 
 
 def main(repo_root: str | None = None) -> None:
