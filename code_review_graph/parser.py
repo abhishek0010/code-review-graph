@@ -207,6 +207,11 @@ _TEST_FILE_PATTERNS = [
     re.compile(r"tests/testthat/"),
 ]
 
+_TEST_RUNNER_NAMES = frozenset({
+    "describe", "it", "test", "beforeEach", "afterEach",
+    "beforeAll", "afterAll",
+})
+
 
 def _is_test_file(path: str) -> bool:
     return any(p.search(path) for p in _TEST_FILE_PATTERNS)
@@ -219,10 +224,7 @@ def _is_test_function(name: str, file_path: str) -> bool:
     if any(p.search(name) for p in _TEST_PATTERNS):
         return True
     # In test files, treat common JS/TS test-runner wrappers as tests
-    if _is_test_file(file_path) and name in (
-        "describe", "it", "test", "beforeEach", "afterEach",
-        "beforeAll", "afterAll",
-    ):
+    if _is_test_file(file_path) and name in _TEST_RUNNER_NAMES:
         return True
     return False
 
@@ -485,6 +487,21 @@ class CodeParser:
         return resolved
 
     _MAX_AST_DEPTH = 180  # Guard against pathologically nested source files
+    _MAX_TEST_DESCRIPTION_LEN = 200  # Cap test description length in node names
+
+    def _get_test_description(self, call_node, source: bytes) -> Optional[str]:
+        """Extract the first string argument from a test runner call node."""
+        for child in call_node.children:
+            if child.type == "arguments":
+                for arg in child.children:
+                    if arg.type in ("string", "template_string"):
+                        raw = arg.text.decode("utf-8", errors="replace")
+                        stripped = raw.strip("'\"`")
+                        normalized = re.sub(r"\s+", " ", stripped).strip()
+                        if len(normalized) > self._MAX_TEST_DESCRIPTION_LEN:
+                            normalized = normalized[: self._MAX_TEST_DESCRIPTION_LEN]
+                        return normalized
+        return None
 
     def _extract_from_tree(
         self,
@@ -655,6 +672,73 @@ class CodeParser:
             # --- Calls ---
             if node_type in call_types:
                 call_name = self._get_call_name(child, language, source)
+
+                # For member expressions like describe.only / it.skip / test.each,
+                # resolve the base call name so those are treated as test runner calls.
+                effective_call_name = call_name
+                if (
+                    call_name
+                    and language in ("javascript", "typescript", "tsx")
+                    and _is_test_file(file_path)
+                    and call_name not in _TEST_RUNNER_NAMES
+                ):
+                    effective_call_name = (
+                        self._get_base_call_name(child, source) or call_name
+                    )
+
+                # Special handling: test runner calls in test files -> Test nodes
+                if (
+                    effective_call_name
+                    and language in ("javascript", "typescript", "tsx")
+                    and _is_test_file(file_path)
+                    and effective_call_name in _TEST_RUNNER_NAMES
+                ):
+                    test_desc = self._get_test_description(child, source)
+                    line_no = child.start_point[0] + 1
+                    synthetic_base = (
+                        f"{effective_call_name}:{test_desc}"
+                        if test_desc else effective_call_name
+                    )
+                    synthetic_name = f"{synthetic_base}@L{line_no}"
+                    qualified = self._qualify(
+                        synthetic_name, file_path, enclosing_class,
+                    )
+
+                    nodes.append(NodeInfo(
+                        kind="Test",
+                        name=synthetic_name,
+                        file_path=file_path,
+                        line_start=child.start_point[0] + 1,
+                        line_end=child.end_point[0] + 1,
+                        language=language,
+                        parent_name=enclosing_class,
+                        is_test=True,
+                    ))
+
+                    # CONTAINS edge: parent -> this test
+                    container = (
+                        self._qualify(enclosing_func, file_path, enclosing_class)
+                        if enclosing_func
+                        else file_path
+                    )
+                    edges.append(EdgeInfo(
+                        kind="CONTAINS",
+                        source=container,
+                        target=qualified,
+                        file_path=file_path,
+                        line=child.start_point[0] + 1,
+                    ))
+
+                    # Recurse into the call's children (the arrow function body)
+                    self._extract_from_tree(
+                        child, source, language, file_path, nodes, edges,
+                        enclosing_class=enclosing_class,
+                        enclosing_func=synthetic_name,
+                        import_map=import_map, defined_names=defined_names,
+                        _depth=_depth + 1,
+                    )
+                    continue
+
                 if call_name and enclosing_func:
                     caller = self._qualify(enclosing_func, file_path, enclosing_class)
                     target = self._resolve_call_target(
@@ -1332,6 +1416,34 @@ class CodeParser:
         if first.type == "namespace_operator":
             return first.text.decode("utf-8", errors="replace")
 
+        return None
+
+    # Modifier suffixes used in JS/TS test runners
+    _TEST_MODIFIER_SUFFIXES = frozenset({
+        "only", "skip", "each", "todo", "concurrent", "failing",
+    })
+
+    def _get_base_call_name(self, node, source: bytes) -> Optional[str]:
+        """Return the base object name for member-expression calls like describe.only()."""
+        if not node.children:
+            return None
+        first = node.children[0]
+        if first.type != "member_expression":
+            return None
+        rightmost: Optional[str] = None
+        for child in reversed(first.children):
+            if child.type in ("identifier", "property_identifier"):
+                rightmost = child.text.decode("utf-8", errors="replace")
+                break
+        if rightmost not in self._TEST_MODIFIER_SUFFIXES:
+            return None
+        for child in first.children:
+            if child.type == "identifier":
+                return child.text.decode("utf-8", errors="replace")
+            if child.type == "member_expression":
+                for inner in child.children:
+                    if inner.type == "identifier":
+                        return inner.text.decode("utf-8", errors="replace")
         return None
 
     # ------------------------------------------------------------------
